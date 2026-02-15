@@ -1,0 +1,33 @@
+# Regole Emodinamica (progetto nuovo)
+# Questo file è pensato per rendere trasparenti (e modificabili) i parametri principali.
+# I vincoli "hard" sono comunque applicati dal solver.
+
+doctors:
+  core:
+    - Vizzari
+    - Virga
+    - Carciotto
+    - Giusti
+  extra:
+    - De Luca
+    - Saporito
+  test_user: "Utente Test"
+
+cells:
+  tue_m_pair: "Vizzari / Virga"
+
+solver:
+  time_limit_seconds_default: 10
+
+  # Multi-pass: se infeasible, il solver rilassa gradualmente alcuni vincoli soft
+  passes:
+    - max_saporito_in_N: 1
+      o_balance_tolerance: 1
+    - max_saporito_in_N: 2
+      o_balance_tolerance: 2
+    - max_saporito_in_N: 3
+      o_balance_tolerance: 3
+
+objective_weights:
+  de_luca: 200
+  saporito: 1000

@@ -1,0 +1,3 @@
+[theme]
+# Optional: you can customize theme on Streamlit Cloud
+base = "light"
