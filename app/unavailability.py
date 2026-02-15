@@ -242,3 +242,73 @@ def is_available_for_slot(index: Dict[str, Dict[dt.date, Set[str]]], doctor: str
     blocked = SLOT_BLOCKS.get(slot, set())
     shifts = (index.get(doctor) or {}).get(day, set())
     return shifts.isdisjoint(blocked)
+
+
+def save_doctor_months(
+    token: str,
+    target: GitHubTarget,
+    doctor: str,
+    updates: Dict[Tuple[int, int], List[UnavailabilityEntry]],
+) -> None:
+    """Replace multiple months for one doctor in a single GitHub write."""
+    if not updates:
+        return
+
+    all_data, sha = get_json(token, target)
+    all_data = _ensure_schema(all_data)
+
+    doctors = all_data["doctors"]
+    entry = doctors.get(doctor)
+    if not isinstance(entry, dict):
+        entry = {"entries": []}
+
+    # Parse existing entries
+    existing_raw = entry.get("entries") or []
+    existing: List[UnavailabilityEntry] = []
+    for r in existing_raw:
+        if not isinstance(r, dict):
+            continue
+        ds = str(r.get("date") or "")[:10]
+        try:
+            d = dt.date.fromisoformat(ds)
+        except Exception:
+            continue
+        sh = norm_shift(str(r.get("shift") or ""))
+        if sh not in _VALID_SET:
+            continue
+        existing.append(UnavailabilityEntry(date=d, shift=sh, note=str(r.get("note") or ""), updated_at=str(r.get("updated_at") or "")))
+
+    now = _utc_now_iso()
+
+    # Apply updates month-by-month
+    merged = list(existing)
+    for (yy, mm), entries_in_month in updates.items():
+        stamped: List[UnavailabilityEntry] = []
+        for e in entries_in_month or []:
+            sh = norm_shift(e.shift)
+            if sh not in _VALID_SET:
+                continue
+            stamped.append(UnavailabilityEntry(date=e.date, shift=sh, note=str(e.note or ""), updated_at=now))
+        merged = _replace_doctor_month(merged, int(yy), int(mm), stamped)
+
+    def _key(e: UnavailabilityEntry):
+        return (e.date.isoformat(), e.shift, e.note)
+
+    merged_sorted = sorted(merged, key=_key)
+
+    doctors[doctor] = {
+        "entries": [
+            {"date": e.date.isoformat(), "shift": e.shift, "note": e.note, "updated_at": e.updated_at}
+            for e in merged_sorted
+        ]
+    }
+    all_data["doctors"] = doctors
+    all_data["updated_at"] = now
+
+    put_json(
+        token=token,
+        target=target,
+        data=all_data,
+        sha=sha,
+        message=f"Update unavailability: {doctor} (multi-month) {now}",
+    )

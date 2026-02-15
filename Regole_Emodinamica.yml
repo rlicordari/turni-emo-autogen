@@ -1,6 +1,5 @@
 # Regole Emodinamica (progetto nuovo)
-# Questo file è pensato per rendere trasparenti (e modificabili) i parametri principali.
-# I vincoli "hard" sono comunque applicati dal solver.
+# File di configurazione: parametri "soft" e testi (i vincoli hard sono nel solver).
 
 doctors:
   core:
@@ -25,9 +24,8 @@ unavailability_mapping:
   J: [Mattina, Pomeriggio, Diurno, Tutto il giorno]  # Assunto come attività diurna del giovedì
 
 solver:
-  time_limit_seconds_default: 10
-
-  # Multi-pass: se infeasible, il solver rilassa gradualmente alcuni vincoli soft
+  # Multi-pass: se infeasible, rilassiamo gradualmente alcuni vincoli soft
+  # (senza toccare i vincoli hard).
   passes:
     - max_saporito_in_N: 1
       o_balance_tolerance: 1
@@ -37,5 +35,6 @@ solver:
       o_balance_tolerance: 3
 
 objective_weights:
+  # Penalità (più alto = meno desiderato)
   de_luca: 200
   saporito: 1000

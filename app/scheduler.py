@@ -102,7 +102,6 @@ def solve_month(
     year: int,
     month: int,
     unavailability: Dict[str, List[UnavailabilityEntry]],
-    time_limit_seconds: int = 10,
 ) -> SolveResult:
     """Entry point. Uses OR-Tools CP-SAT if available; otherwise a greedy fallback."""
     rules = load_rules(Path(__file__).resolve().parents[1] / "Regole_Emodinamica.yml")
@@ -113,7 +112,7 @@ def solve_month(
         return SolveResult(False, {}, msg)
 
     if _HAS_ORTOOLS:
-        return _solve_month_cpsat(year, month, index, rules=rules, time_limit_seconds=time_limit_seconds)
+        return _solve_month_cpsat(year, month, index, rules=rules)
 
     return _solve_month_greedy(year, month, index, rules=rules)
 
@@ -122,7 +121,7 @@ def solve_month(
 # CP-SAT solver (preferred)
 # --------------------------------------------------------------------------------------
 
-def _solve_month_cpsat(year: int, month: int, index, rules: Rules, time_limit_seconds: int) -> SolveResult:
+def _solve_month_cpsat(year: int, month: int, index, rules: Rules) -> SolveResult:
     assert cp_model is not None
 
     dates = _month_dates(year, month)
@@ -399,8 +398,8 @@ def _solve_month_cpsat(year: int, month: int, index, rules: Rules, time_limit_se
         model.Minimize(int(rules.weight_deluca) * sum(de_bools) + int(rules.weight_saporito) * sum(sap_bools))
 
         solver = cp_model.CpSolver()
-        solver.parameters.max_time_in_seconds = float(time_limit_seconds)
         solver.parameters.num_search_workers = 8
+        solver.parameters.stop_after_first_solution = True
 
         status = solver.Solve(model)
         if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
