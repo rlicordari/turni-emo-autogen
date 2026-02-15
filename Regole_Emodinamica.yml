@@ -16,6 +16,14 @@ doctors:
 cells:
   tue_m_pair: "Vizzari / Virga"
 
+# Mappatura fasce indisponibilità → colonne (implementata nel codice)
+unavailability_mapping:
+  M: [Mattina, Diurno, Tutto il giorno]        # Emodinamica Mattina
+  N: [Pomeriggio, Diurno, Tutto il giorno]     # Emodinamica Pomeriggio
+  O: [Notte, Tutto il giorno]                  # Reperibilità Notte (mattina/pomeriggio/diurno NON bloccano)
+  P: [Mattina, Diurno, Tutto il giorno]        # Ambulatorio (mattina)
+  J: [Mattina, Pomeriggio, Diurno, Tutto il giorno]  # Assunto come attività diurna del giovedì
+
 solver:
   time_limit_seconds_default: 10
 

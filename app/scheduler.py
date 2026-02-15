@@ -1,14 +1,26 @@
+
 from __future__ import annotations
 
 import calendar
 import datetime as dt
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
 from .config import (
     ALL_DOCTORS,
     CORE_DOCTORS,
     MON, TUE, WED, THU, FRI, SAT, SUN,
+)
+from .rules import load_rules, Rules
+from .unavailability import (
+    UnavailabilityEntry,
+    build_index,
+    is_available_for_slot,
+    SLOT_MORNING,
+    SLOT_AFTERNOON,
+    SLOT_NIGHT,
+    SLOT_DAY,
 )
 
 try:
@@ -17,9 +29,6 @@ try:
 except Exception:
     cp_model = None  # type: ignore
     _HAS_ORTOOLS = False
-
-from pathlib import Path
-from .rules import load_rules, Rules
 
 
 @dataclass
@@ -61,41 +70,59 @@ def _first_following_weekend_for_friday(friday: dt.date, weekends: List[Tuple[dt
     return None
 
 
-def _is_available(unavailability: Dict[str, Set[dt.date]], name: str, d: dt.date) -> bool:
-    return d not in unavailability.get(name, set())
+def _available(index, name: str, d: dt.date, slot: str) -> bool:
+    return is_available_for_slot(index, name, d, slot)
 
 
-def _precheck(year: int, month: int, unavailability: Dict[str, Set[dt.date]]) -> Optional[str]:
+def _precheck(year: int, month: int, index) -> Optional[str]:
     dates = _month_dates(year, month)
+
+    # Martedì: M richiede sempre Vizzari + Virga (fascia mattina)
     for d in dates:
         if d.weekday() == TUE:
-            if d in unavailability.get("Vizzari", set()) or d in unavailability.get("Virga", set()):
-                return f"Infeasible: il martedì {d.strftime('%d/%m/%Y')} richiede sempre Vizzari+Virga in M, ma uno dei due è indisponibile."
+            if (not _available(index, "Vizzari", d, SLOT_MORNING)) or (not _available(index, "Virga", d, SLOT_MORNING)):
+                return (
+                    f"Infeasible: il martedì {d.strftime('%d/%m/%Y')} richiede sempre Vizzari+Virga in M "
+                    f"(Emodinamica Mattina), ma uno dei due risulta indisponibile in fascia mattina/diurno/tutto il giorno."
+                )
+
+    # Giovedì: J richiede Carciotto o Giusti (assunto come attività diurna)
     for d in _thursdays(dates):
-        if (d in unavailability.get("Carciotto", set())) and (d in unavailability.get("Giusti", set())):
-            return f"Infeasible: il giovedì {d.strftime('%d/%m/%Y')} la colonna J richiede Carciotto o Giusti, ma sono entrambi indisponibili."
+        ok_c = _available(index, "Carciotto", d, SLOT_DAY)
+        ok_g = _available(index, "Giusti", d, SLOT_DAY)
+        if not (ok_c or ok_g):
+            return (
+                f"Infeasible: il giovedì {d.strftime('%d/%m/%Y')} la colonna J richiede Carciotto o Giusti, "
+                f"ma risultano entrambi indisponibili (mattina/pomeriggio/diurno/tutto il giorno)."
+            )
     return None
 
 
-def solve_month(year: int, month: int, unavailability: Dict[str, Set[dt.date]], time_limit_seconds: int = 10) -> SolveResult:
+def solve_month(
+    year: int,
+    month: int,
+    unavailability: Dict[str, List[UnavailabilityEntry]],
+    time_limit_seconds: int = 10,
+) -> SolveResult:
     """Entry point. Uses OR-Tools CP-SAT if available; otherwise a greedy fallback."""
     rules = load_rules(Path(__file__).resolve().parents[1] / "Regole_Emodinamica.yml")
-    msg = _precheck(year, month, unavailability)
+    index = build_index(unavailability)
+
+    msg = _precheck(year, month, index)
     if msg:
         return SolveResult(False, {}, msg)
 
     if _HAS_ORTOOLS:
-        return _solve_month_cpsat(year, month, unavailability, rules=rules, time_limit_seconds=time_limit_seconds)
+        return _solve_month_cpsat(year, month, index, rules=rules, time_limit_seconds=time_limit_seconds)
 
-    # Fallback (dev/local): no ortools installed.
-    return _solve_month_greedy(year, month, unavailability, rules=rules)
+    return _solve_month_greedy(year, month, index, rules=rules)
 
 
 # --------------------------------------------------------------------------------------
 # CP-SAT solver (preferred)
 # --------------------------------------------------------------------------------------
 
-def _solve_month_cpsat(year: int, month: int, unavailability: Dict[str, Set[dt.date]], rules: Rules, time_limit_seconds: int) -> SolveResult:
+def _solve_month_cpsat(year: int, month: int, index, rules: Rules, time_limit_seconds: int) -> SolveResult:
     assert cp_model is not None
 
     dates = _month_dates(year, month)
@@ -105,44 +132,58 @@ def _solve_month_cpsat(year: int, month: int, unavailability: Dict[str, Set[dt.d
 
     doc_list = list(ALL_DOCTORS)  # excludes TEST_USER by design
     doc_idx = {name: i for i, name in enumerate(doc_list)}
-    core_idx = [doc_idx[n] for n in CORE_DOCTORS]
+    core_idx = [doc_idx[nm] for nm in CORE_DOCTORS]
+
     de_luca_idx = doc_idx["De Luca"]
     saporito_idx = doc_idx["Saporito"]
     carciotto_idx = doc_idx["Carciotto"]
     giusti_idx = doc_idx["Giusti"]
 
     passes = [{"max_saporito": sp.max_saporito_in_N, "o_balance_tol": sp.o_balance_tolerance} for sp in rules.passes]
-
     last_fail_log = ""
+
+    def _available_slots(name: str, day: dt.date, slots: List[str]) -> bool:
+        return all(_available(index, name, day, s) for s in slots)
 
     for attempt, p in enumerate(passes, start=1):
         model = cp_model.CpModel()
 
+        # Weekend variable: one CORE doctor, same for Sat/Sun and for M,N,O
         weekend_var: Dict[Tuple[dt.date, dt.date], cp_model.IntVar] = {}
         for sat, sun in weekends:
             allowed = []
             for idx in core_idx:
                 nm = doc_list[idx]
-                if _is_available(unavailability, nm, sat) and _is_available(unavailability, nm, sun):
+                # weekend doctor must cover M (morning), N (afternoon), O (night) on both days
+                if (
+                    _available_slots(nm, sat, [SLOT_MORNING, SLOT_AFTERNOON, SLOT_NIGHT])
+                    and _available_slots(nm, sun, [SLOT_MORNING, SLOT_AFTERNOON, SLOT_NIGHT])
+                ):
                     allowed.append(idx)
             if not allowed:
-                last_fail_log = f"Infeasible: weekend {sat.strftime('%d/%m')}–{sun.strftime('%d/%m')} nessun medico CORE disponibile su entrambi i giorni."
+                last_fail_log = (
+                    f"Infeasible: weekend {sat.strftime('%d/%m')}–{sun.strftime('%d/%m')} "
+                    f"nessun medico CORE disponibile su tutte le fasce richieste (M,N,O) in entrambi i giorni."
+                )
                 model = None
                 break
-            weekend_var[(sat, sun)] = model.NewIntVarFromDomain(cp_model.Domain.FromValues(allowed), f"W_{sat.isoformat()}")
+            weekend_var[(sat, sun)] = model.NewIntVarFromDomain(
+                cp_model.Domain.FromValues(allowed), f"W_{sat.isoformat()}"
+            )
 
         if model is None:
             continue
 
+        # Friday variable: CORE doctor for M and O (morning + night) on that Friday
         friday_var: Dict[dt.date, cp_model.IntVar] = {}
         for fri in fridays:
             allowed = []
             for idx in core_idx:
                 nm = doc_list[idx]
-                if _is_available(unavailability, nm, fri):
+                if _available_slots(nm, fri, [SLOT_MORNING, SLOT_NIGHT]):
                     allowed.append(idx)
             if not allowed:
-                last_fail_log = f"Infeasible: venerdì {fri.strftime('%d/%m/%Y')} nessun medico CORE disponibile."
+                last_fail_log = f"Infeasible: venerdì {fri.strftime('%d/%m/%Y')} nessun medico CORE disponibile per M+O (mattina+notte)."
                 model = None
                 break
             friday_var[fri] = model.NewIntVarFromDomain(cp_model.Domain.FromValues(allowed), f"F_{fri.isoformat()}")
@@ -150,14 +191,22 @@ def _solve_month_cpsat(year: int, month: int, unavailability: Dict[str, Set[dt.d
         if model is None:
             continue
 
+        # J on Thursdays: Carciotto or Giusti (diurno)
         j_var: Dict[dt.date, cp_model.IntVar] = {}
         for thu in thursdays:
             allowed = []
-            if _is_available(unavailability, "Carciotto", thu):
+            if _available(index, "Carciotto", thu, SLOT_DAY):
                 allowed.append(carciotto_idx)
-            if _is_available(unavailability, "Giusti", thu):
+            if _available(index, "Giusti", thu, SLOT_DAY):
                 allowed.append(giusti_idx)
+            if not allowed:
+                last_fail_log = f"Infeasible: giovedì {thu.strftime('%d/%m/%Y')} nessun candidato disponibile per J."
+                model = None
+                break
             j_var[thu] = model.NewIntVarFromDomain(cp_model.Domain.FromValues(allowed), f"J_{thu.isoformat()}")
+
+        if model is None:
+            continue
 
         m_var: Dict[dt.date, Optional[cp_model.IntVar]] = {}
         n_var: Dict[dt.date, cp_model.IntVar] = {}
@@ -167,99 +216,124 @@ def _solve_month_cpsat(year: int, month: int, unavailability: Dict[str, Set[dt.d
         weekend_lookup = {sat: (sat, sun) for (sat, sun) in weekends}
         weekend_lookup.update({sun: (sat, sun) for (sat, sun) in weekends})
 
-        def allowed_for_slot(d: dt.date, col: str) -> List[int]:
-            wd = d.weekday()
+        def allowed_for_slot(day: dt.date, col: str) -> List[int]:
+            """Allowed doctor indexes for a specific column on a specific day, considering fascia-based unavailability."""
+            wd = day.weekday()
             allowed = set(range(len(doc_list)))
 
-            # remove unavailable on that day
+            # 1) availability by slot
+            if col in ("M", "P"):
+                slot = SLOT_MORNING
+            elif col == "N":
+                slot = SLOT_AFTERNOON
+            elif col == "O":
+                slot = SLOT_NIGHT
+            else:
+                slot = SLOT_DAY
+
             for nm in doc_list:
-                if not _is_available(unavailability, nm, d):
+                if not _available(index, nm, day, slot):
                     allowed.discard(doc_idx[nm])
 
+            # 2) hard pool rules
             if col == "O":
-                allowed.discard(saporito_idx)
-                if wd not in (MON, TUE):
+                allowed.discard(saporito_idx)  # never Saporito in O
+
+                # De Luca can appear in O on Mon/Tue/Wed, but:
+                # - Mon/Tue only if ALL core are unavailable for NIGHT that day (fallback)
+                # - Wed: allowed normally
+                if wd not in (MON, TUE, WED):
                     allowed.discard(de_luca_idx)
-                else:
-                    any_core = any(_is_available(unavailability, nm, d) for nm in CORE_DOCTORS)
-                    if any_core:
+                elif wd in (MON, TUE):
+                    any_core_available = any(_available(index, nm, day, SLOT_NIGHT) for nm in CORE_DOCTORS)
+                    if any_core_available:
                         allowed.discard(de_luca_idx)
 
             if col == "M":
+                allowed.discard(saporito_idx)
                 if wd != WED:
                     allowed.discard(de_luca_idx)
-                allowed.discard(saporito_idx)
 
             if col == "N":
+                # De Luca only Mon/Tue/Wed
                 if wd not in (MON, TUE, WED):
                     allowed.discard(de_luca_idx)
+                # Saporito only Mon-Fri
                 if wd in (SAT, SUN):
                     allowed.discard(saporito_idx)
 
             if col == "P":
+                # only Wed, handled outside; but keep safe
                 allowed.discard(saporito_idx)
+                if wd != WED:
+                    allowed.discard(de_luca_idx)
 
             return sorted(allowed)
 
-        for d in dates:
-            wd = d.weekday()
+        # Build per-day variables with special rules (Tue pair, weekend, Friday)
+        for day in dates:
+            wd = day.weekday()
 
+            # M
             if wd == TUE:
-                m_var[d] = None
-            elif d in weekend_lookup:
-                m_var[d] = weekend_var[weekend_lookup[d]]
+                m_var[day] = None  # fixed string (Vizzari/Virga)
+            elif day in weekend_lookup:
+                m_var[day] = weekend_var[weekend_lookup[day]]
             elif wd == FRI:
-                m_var[d] = friday_var[d]
+                m_var[day] = friday_var[day]
             else:
-                allowed = allowed_for_slot(d, "M")
+                allowed = allowed_for_slot(day, "M")
                 if not allowed:
-                    last_fail_log = f"Infeasible: nessun medico disponibile per M il {d.strftime('%d/%m/%Y')}"
+                    last_fail_log = f"Infeasible: nessun medico disponibile per M (mattina) il {day.strftime('%d/%m/%Y')}"
                     model = None
                     break
-                m_var[d] = model.NewIntVarFromDomain(cp_model.Domain.FromValues(allowed), f"M_{d.isoformat()}")
+                m_var[day] = model.NewIntVarFromDomain(cp_model.Domain.FromValues(allowed), f"M_{day.isoformat()}")
 
-            if d in weekend_lookup:
-                n_var[d] = weekend_var[weekend_lookup[d]]
+            # N
+            if day in weekend_lookup:
+                n_var[day] = weekend_var[weekend_lookup[day]]
             else:
-                allowed = allowed_for_slot(d, "N")
+                allowed = allowed_for_slot(day, "N")
                 if not allowed:
-                    last_fail_log = f"Infeasible: nessun medico disponibile per N il {d.strftime('%d/%m/%Y')}"
+                    last_fail_log = f"Infeasible: nessun medico disponibile per N (pomeriggio) il {day.strftime('%d/%m/%Y')}"
                     model = None
                     break
-                n_var[d] = model.NewIntVarFromDomain(cp_model.Domain.FromValues(allowed), f"N_{d.isoformat()}")
+                n_var[day] = model.NewIntVarFromDomain(cp_model.Domain.FromValues(allowed), f"N_{day.isoformat()}")
 
-            if d in weekend_lookup:
-                o_var[d] = weekend_var[weekend_lookup[d]]
+            # O
+            if day in weekend_lookup:
+                o_var[day] = weekend_var[weekend_lookup[day]]
             elif wd == FRI:
-                o_var[d] = friday_var[d]
+                o_var[day] = friday_var[day]
             else:
-                allowed = allowed_for_slot(d, "O")
+                allowed = allowed_for_slot(day, "O")
                 if not allowed:
-                    last_fail_log = f"Infeasible: nessun medico disponibile per O il {d.strftime('%d/%m/%Y')}"
+                    last_fail_log = f"Infeasible: nessun medico disponibile per O (notte) il {day.strftime('%d/%m/%Y')}"
                     model = None
                     break
-                o_var[d] = model.NewIntVarFromDomain(cp_model.Domain.FromValues(allowed), f"O_{d.isoformat()}")
+                o_var[day] = model.NewIntVarFromDomain(cp_model.Domain.FromValues(allowed), f"O_{day.isoformat()}")
 
+            # P (only Wed)
             if wd == WED:
-                allowed = allowed_for_slot(d, "P")
+                allowed = allowed_for_slot(day, "P")
                 if not allowed:
-                    last_fail_log = f"Infeasible: nessun medico disponibile per P (mercoledì) il {d.strftime('%d/%m/%Y')}"
+                    last_fail_log = f"Infeasible: nessun medico disponibile per P (ambulatorio mattina) il {day.strftime('%d/%m/%Y')}"
                     model = None
                     break
-                p_var[d] = model.NewIntVarFromDomain(cp_model.Domain.FromValues(allowed), f"P_{d.isoformat()}")
+                p_var[day] = model.NewIntVarFromDomain(cp_model.Domain.FromValues(allowed), f"P_{day.isoformat()}")
             else:
-                p_var[d] = None
+                p_var[day] = None
 
         if model is None:
             continue
 
-        # Friday != immediate weekend
+        # Friday doctor != immediate following weekend doctor
         for fri in fridays:
             w = _first_following_weekend_for_friday(fri, weekends)
             if w is not None:
                 model.Add(friday_var[fri] != weekend_var[w])
 
-        # J restrictions (Thu and Fri)
+        # J restrictions (Thu and Fri): the J doctor cannot appear in M/N/O on Thu nor the day after
         for thu in thursdays:
             j = j_var[thu]
             if m_var[thu] is not None:
@@ -267,11 +341,12 @@ def _solve_month_cpsat(year: int, month: int, unavailability: Dict[str, Set[dt.d
             model.Add(n_var[thu] != j)
             model.Add(o_var[thu] != j)
 
-            fri = thu + dt.timedelta(days=1)
-            if fri.year == year and fri.month == month and fri.weekday() == FRI:
-                model.Add(friday_var[fri] != j)
-                model.Add(n_var[fri] != j)
+            nxt = thu + dt.timedelta(days=1)
+            if nxt.year == year and nxt.month == month and nxt.weekday() == FRI:
+                model.Add(friday_var[nxt] != j)  # covers M and O on Friday
+                model.Add(n_var[nxt] != j)
 
+        # --- Balancing helpers ---
         def add_balancing(vars_list: List[cp_model.IntVar], allowed_doctors: List[int], tol: int, tag: str):
             if not vars_list:
                 return {}, None, None
@@ -297,23 +372,26 @@ def _solve_month_cpsat(year: int, month: int, unavailability: Dict[str, Set[dt.d
         fr_counts, _, _ = add_balancing(list(friday_var.values()), core_idx, tol=1, tag="fri")
         j_counts, _, _ = add_balancing(list(j_var.values()), [carciotto_idx, giusti_idx], tol=1, tag="thuJ")
 
+        # O distribution balanced among CORE (De Luca only Mon/Tue fallback, but on Wed could appear; keep as soft)
         o_vars_per_day = [o_var[d] for d in dates]
         o_counts, _, _ = add_balancing(o_vars_per_day, core_idx, tol=int(p["o_balance_tol"]), tag="Odist")
 
+        # Saporito in N limited (soft via multipass)
         sap_bools = []
-        for d in dates:
-            b = model.NewBoolVar(f"N_is_sap_{d.isoformat()}")
-            model.Add(n_var[d] == saporito_idx).OnlyEnforceIf(b)
-            model.Add(n_var[d] != saporito_idx).OnlyEnforceIf(b.Not())
+        for day in dates:
+            b = model.NewBoolVar(f"N_is_sap_{day.isoformat()}")
+            model.Add(n_var[day] == saporito_idx).OnlyEnforceIf(b)
+            model.Add(n_var[day] != saporito_idx).OnlyEnforceIf(b.Not())
             sap_bools.append(b)
         model.Add(sum(sap_bools) <= int(p["max_saporito"]))
 
+        # Penalize De Luca usage (any slot)
         de_bools = []
-        for d in dates:
-            for v in (m_var[d], n_var[d], o_var[d], p_var[d]):
+        for day in dates:
+            for v in (m_var[day], n_var[day], o_var[day], p_var[day]):
                 if v is None:
                     continue
-                b = model.NewBoolVar(f"is_deluca_{v.Name()}_{d.isoformat()}")
+                b = model.NewBoolVar(f"is_deluca_{v.Name()}_{day.isoformat()}")
                 model.Add(v == de_luca_idx).OnlyEnforceIf(b)
                 model.Add(v != de_luca_idx).OnlyEnforceIf(b.Not())
                 de_bools.append(b)
@@ -330,48 +408,46 @@ def _solve_month_cpsat(year: int, month: int, unavailability: Dict[str, Set[dt.d
             continue
 
         out: Dict[dt.date, Dict[str, str]] = {}
-        for d in dates:
-            wd = d.weekday()
+        for day in dates:
+            wd = day.weekday()
             row: Dict[str, str] = {}
-            if wd == THU:
-                row["J"] = doc_list[int(solver.Value(j_var[d]))]
-            else:
-                row["J"] = ""
-            if wd == TUE:
-                row["M"] = rules.tue_m_pair
-            else:
-                v = m_var[d]
-                row["M"] = doc_list[int(solver.Value(v))] if v is not None else ""
-            row["N"] = doc_list[int(solver.Value(n_var[d]))]
-            row["O"] = doc_list[int(solver.Value(o_var[d]))]
-            row["P"] = doc_list[int(solver.Value(p_var[d]))] if (wd == WED and p_var[d] is not None) else ""
-            out[d] = row
+            row["J"] = doc_list[int(solver.Value(j_var[day]))] if wd == THU else ""
+            row["M"] = rules.tue_m_pair if wd == TUE else doc_list[int(solver.Value(m_var[day]))]  # type: ignore
+            row["N"] = doc_list[int(solver.Value(n_var[day]))]
+            row["O"] = doc_list[int(solver.Value(o_var[day]))]
+            row["P"] = doc_list[int(solver.Value(p_var[day]))] if (wd == WED and p_var[day] is not None) else ""
+            out[day] = row
 
         def _count(name: str, col: str) -> int:
-            return sum(1 for d in dates if out[d][col] == name)
+            return sum(1 for day in dates if out[day][col] == name)
 
         lines = []
         lines.append(f"OK (attempt {attempt}) – {calendar.month_name[month]} {year}")
+
         lines.append("\nWeekend assignments (by weekend):")
         for nm in CORE_DOCTORS:
             idx = doc_idx[nm]
             if wk_counts:
                 lines.append(f"- {nm}: {int(solver.Value(wk_counts[idx]))}")
+
         lines.append("\nFriday M/O assignments (by Friday):")
         for nm in CORE_DOCTORS:
             idx = doc_idx[nm]
             if fr_counts:
                 lines.append(f"- {nm}: {int(solver.Value(fr_counts[idx]))}")
+
         lines.append("\nThursday J assignments:")
         lines.append(f"- Carciotto: {int(solver.Value(j_counts[carciotto_idx])) if j_counts else 0}")
         lines.append(f"- Giusti: {int(solver.Value(j_counts[giusti_idx])) if j_counts else 0}")
-        lines.append("\nO distribution (by day count):")
+
+        lines.append("\nO distribution (by day count, CORE only):")
         for nm in CORE_DOCTORS:
             idx = doc_idx[nm]
             if o_counts:
                 lines.append(f"- {nm}: {int(solver.Value(o_counts[idx]))}")
+
         lines.append(f"\nSaporito in N: {_count('Saporito','N')}")
-        lines.append(f"De Luca total appearances (M/N/O/P): {sum(1 for d in dates for c in ['M','N','O','P'] if out[d][c]=='De Luca')}")
+        lines.append(f"De Luca total appearances (M/N/O/P): {sum(1 for day in dates for c in ['M','N','O','P'] if out[day][c]=='De Luca')}")
         return SolveResult(ok=True, assignment=out, log="\n".join(lines))
 
     return SolveResult(ok=False, assignment={}, log=last_fail_log or "Infeasible.")
@@ -381,35 +457,40 @@ def _solve_month_cpsat(year: int, month: int, unavailability: Dict[str, Set[dt.d
 # Greedy fallback (only if ortools is not available in the runtime)
 # --------------------------------------------------------------------------------------
 
-def _solve_month_greedy(year: int, month: int, unavailability: Dict[str, Set[dt.date]], rules: Rules) -> SolveResult:
+def _solve_month_greedy(year: int, month: int, index, rules: Rules) -> SolveResult:
     dates = _month_dates(year, month)
     weekends = _weekends(dates)
     fridays = _fridays(dates)
     thursdays = _thursdays(dates)
 
-    # Assign weekends balanced
+    def avail(doc: str, day: dt.date, slot: str) -> bool:
+        return _available(index, doc, day, slot)
+
+    # Assign weekends balanced (must cover M,N,O)
     wk_assign: Dict[Tuple[dt.date, dt.date], str] = {}
     wk_count = {d: 0 for d in CORE_DOCTORS}
-
-    for w in weekends:
-        sat, sun = w
-        choices = [nm for nm in CORE_DOCTORS if _is_available(unavailability, nm, sat) and _is_available(unavailability, nm, sun)]
+    for sat, sun in weekends:
+        def ok(doc: str) -> bool:
+            return (
+                avail(doc, sat, SLOT_MORNING) and avail(doc, sat, SLOT_AFTERNOON) and avail(doc, sat, SLOT_NIGHT)
+                and avail(doc, sun, SLOT_MORNING) and avail(doc, sun, SLOT_AFTERNOON) and avail(doc, sun, SLOT_NIGHT)
+            )
+        choices = [nm for nm in CORE_DOCTORS if ok(nm)]
         if not choices:
-            return SolveResult(False, {}, f"Infeasible (greedy): weekend {sat.strftime('%d/%m')}–{sun.strftime('%d/%m')} nessun CORE disponibile.")
-        # pick min count
+            return SolveResult(False, {}, f"Infeasible (greedy): weekend {sat.strftime('%d/%m')}–{sun.strftime('%d/%m')} nessun CORE disponibile su M/N/O.")
         choices.sort(key=lambda nm: wk_count[nm])
         chosen = choices[0]
-        wk_assign[w] = chosen
+        wk_assign[(sat, sun)] = chosen
         wk_count[chosen] += 1
 
-    # Assign J on Thursdays balanced between Carciotto/Giusti
+    # Assign J on Thursdays balanced between Carciotto/Giusti (diurno)
     j_assign: Dict[dt.date, str] = {}
     j_count = {"Carciotto": 0, "Giusti": 0}
     for thu in thursdays:
         choices = []
-        if _is_available(unavailability, "Carciotto", thu):
+        if avail("Carciotto", thu, SLOT_DAY):
             choices.append("Carciotto")
-        if _is_available(unavailability, "Giusti", thu):
+        if avail("Giusti", thu, SLOT_DAY):
             choices.append("Giusti")
         if not choices:
             return SolveResult(False, {}, f"Infeasible (greedy): giovedì {thu.strftime('%d/%m/%Y')} J richiede Carciotto o Giusti.")
@@ -418,45 +499,52 @@ def _solve_month_greedy(year: int, month: int, unavailability: Dict[str, Set[dt.
         j_assign[thu] = chosen
         j_count[chosen] += 1
 
-    # Assign Fridays balanced, avoiding the immediately following weekend doctor
+    # Assign Fridays balanced, avoiding the immediately following weekend doctor (must cover M+O)
     fri_assign: Dict[dt.date, str] = {}
     fri_count = {d: 0 for d in CORE_DOCTORS}
     for fri in fridays:
         next_w = _first_following_weekend_for_friday(fri, weekends)
         banned = wk_assign.get(next_w) if next_w else None
-        choices = [nm for nm in CORE_DOCTORS if _is_available(unavailability, nm, fri) and nm != banned]
+        choices = [nm for nm in CORE_DOCTORS if avail(nm, fri, SLOT_MORNING) and avail(nm, fri, SLOT_NIGHT) and nm != banned]
         if not choices:
-            # if forced, allow banned (better than fail), but log it
-            choices = [nm for nm in CORE_DOCTORS if _is_available(unavailability, nm, fri)]
+            choices = [nm for nm in CORE_DOCTORS if avail(nm, fri, SLOT_MORNING) and avail(nm, fri, SLOT_NIGHT)]
         if not choices:
-            return SolveResult(False, {}, f"Infeasible (greedy): venerdì {fri.strftime('%d/%m/%Y')} nessun CORE disponibile.")
+            return SolveResult(False, {}, f"Infeasible (greedy): venerdì {fri.strftime('%d/%m/%Y')} nessun CORE disponibile per M+O.")
         choices.sort(key=lambda nm: fri_count[nm])
         chosen = choices[0]
         fri_assign[fri] = chosen
         fri_count[chosen] += 1
 
-    # Build daily assignments
+    weekend_lookup = {sat: (sat, sun) for (sat, sun) in weekends}
+    weekend_lookup.update({sun: (sat, sun) for (sat, sun) in weekends})
+
     out: Dict[dt.date, Dict[str, str]] = {}
     o_count = {d: 0 for d in CORE_DOCTORS}
     sap_count = 0
-    deluca_count = 0
 
-    def pick_allowed(d: dt.date, col: str, banned: Set[str] = set(), prefer_core_balance: bool = False) -> str:
-        wd = d.weekday()
+    def pick_allowed(day: dt.date, col: str, banned: Set[str] = set(), prefer_core_balance: bool = False) -> str:
+        wd = day.weekday()
+
+        if col in ("M", "P"):
+            slot = SLOT_MORNING
+        elif col == "N":
+            slot = SLOT_AFTERNOON
+        else:
+            slot = SLOT_NIGHT
+
         allowed = set(ALL_DOCTORS)
-        # remove unavailable
-        for nm in list(allowed):
-            if not _is_available(unavailability, nm, d):
-                allowed.discard(nm)
+
+        # slot-based availability
+        allowed = {nm for nm in allowed if avail(nm, day, slot)}
         allowed -= set(banned)
 
+        # pool hard rules
         if col == "O":
             allowed.discard("Saporito")
-            # De Luca only Mon/Tue fallback
-            if wd not in (MON, TUE):
+            if wd not in (MON, TUE, WED):
                 allowed.discard("De Luca")
-            else:
-                any_core = any(_is_available(unavailability, nm, d) for nm in CORE_DOCTORS)
+            elif wd in (MON, TUE):
+                any_core = any(avail(nm, day, SLOT_NIGHT) for nm in CORE_DOCTORS)
                 if any_core:
                     allowed.discard("De Luca")
 
@@ -473,89 +561,80 @@ def _solve_month_greedy(year: int, month: int, unavailability: Dict[str, Set[dt.
 
         if col == "P":
             allowed.discard("Saporito")
+            if wd != WED:
+                allowed.discard("De Luca")
 
         if not allowed:
-            raise ValueError(f"No allowed doctors for {col} on {d}")
+            raise ValueError(f"No allowed doctors for {col} on {day}")
 
-        # Prefer CORE balancing for O
         if prefer_core_balance:
             core_allowed = [nm for nm in CORE_DOCTORS if nm in allowed]
             if core_allowed:
                 core_allowed.sort(key=lambda nm: o_count[nm])
                 return core_allowed[0]
 
-        # Penalize Saporito
-        if "Saporito" in allowed:
-            # keep it last
-            others = [nm for nm in allowed if nm != "Saporito"]
-            if others:
-                return sorted(others)[0]
+        # Penalize Saporito: keep it last
+        if "Saporito" in allowed and len(allowed) > 1:
+            allowed = {nm for nm in allowed if nm != "Saporito"}  # greedy: don't choose unless forced
+
         return sorted(allowed)[0]
 
-    weekend_lookup = {sat: (sat, sun) for (sat, sun) in weekends}
-    weekend_lookup.update({sun: (sat, sun) for (sat, sun) in weekends})
-
-    for d in dates:
-        wd = d.weekday()
+    # Build schedule day-by-day
+    for day in dates:
+        wd = day.weekday()
         row = {"J": "", "M": "", "N": "", "O": "", "P": ""}
 
+        # J Thu
         if wd == THU:
-            row["J"] = j_assign[d]
-            banned_thu = {row["J"]}
-        else:
-            banned_thu = set()
-
-        # ban for Friday (day after Thu with J)
-        banned_for_day = set()
-        if wd == FRI:
-            thu = d - dt.timedelta(days=1)
-            if thu in j_assign:
-                banned_for_day.add(j_assign[thu])
+            row["J"] = j_assign[day]
 
         # M
         if wd == TUE:
             row["M"] = rules.tue_m_pair
-        elif d in weekend_lookup:
-            row["M"] = wk_assign[weekend_lookup[d]]
+        elif day in weekend_lookup:
+            row["M"] = wk_assign[weekend_lookup[day]]
         elif wd == FRI:
-            row["M"] = fri_assign[d]
+            row["M"] = fri_assign[day]
         else:
-            row["M"] = pick_allowed(d, "M", banned=banned_thu | banned_for_day)
+            banned = set()
+            if wd == THU:
+                banned.add(row["J"])
+            row["M"] = pick_allowed(day, "M", banned=banned)
 
         # N
-        if d in weekend_lookup:
-            row["N"] = wk_assign[weekend_lookup[d]]
+        if day in weekend_lookup:
+            row["N"] = wk_assign[weekend_lookup[day]]
         else:
-            row["N"] = pick_allowed(d, "N", banned=banned_thu | banned_for_day)
+            banned = set()
+            if wd == THU:
+                banned.add(row["J"])
+            # next day after Thu (Fri) J cannot appear in N
+            if wd == FRI and (day - dt.timedelta(days=1)).weekday() == THU:
+                jdoc = j_assign.get(day - dt.timedelta(days=1))
+                if jdoc:
+                    banned.add(jdoc)
+            row["N"] = pick_allowed(day, "N", banned=banned)
 
         # O
-        if d in weekend_lookup:
-            row["O"] = wk_assign[weekend_lookup[d]]
+        if day in weekend_lookup:
+            row["O"] = wk_assign[weekend_lookup[day]]
         elif wd == FRI:
-            row["O"] = fri_assign[d]
+            row["O"] = fri_assign[day]
         else:
-            row["O"] = pick_allowed(d, "O", banned=banned_thu | banned_for_day, prefer_core_balance=True)
+            banned = set()
+            if wd == THU:
+                banned.add(row["J"])
+            row["O"] = pick_allowed(day, "O", banned=banned, prefer_core_balance=True)
+            if row["O"] in CORE_DOCTORS:
+                o_count[row["O"]] += 1
 
-        # P
+        # P (Wed)
         if wd == WED:
-            row["P"] = pick_allowed(d, "P")
+            row["P"] = pick_allowed(day, "P")
 
-        out[d] = row
+        # enforce J restriction on Fri for M/O already via fri_assign; in greedy we don't add extra here.
 
-        if row["O"] in CORE_DOCTORS:
-            o_count[row["O"]] += 1
-        if row["N"] == "Saporito":
-            sap_count += 1
-        if "De Luca" in (row["M"], row["N"], row["O"], row["P"]):
-            deluca_count += 1
+        out[day] = row
 
-    log = [
-        "OK (greedy fallback) – ortools non disponibile nel runtime.",
-        "Weekend counts: " + ", ".join(f"{k}={v}" for k, v in wk_count.items()),
-        "Friday counts: " + ", ".join(f"{k}={v}" for k, v in fri_count.items()),
-        "J counts: " + ", ".join(f"{k}={v}" for k, v in j_count.items()),
-        "O counts: " + ", ".join(f"{k}={v}" for k, v in o_count.items()),
-        f"Saporito in N: {sap_count}",
-        f"De Luca appearances: {deluca_count}",
-    ]
-    return SolveResult(True, out, "\n".join(log))
+    lines = ["OK (greedy fallback)"]
+    return SolveResult(ok=True, assignment=out, log="\n".join(lines))
